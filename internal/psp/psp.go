@@ -98,6 +98,17 @@ func withResilience(inner PaymentProcessor) PaymentProcessor {
 
 func (r *resilientProcessor) Name() string { return r.inner.Name() }
 
+// asUnavailable maps the breaker's own refusals onto ErrUnavailable. Without
+// this they surface as unclassified errors, and the saga reads an unclassified
+// error as a DECLINE — so an open circuit (i.e. the processor is down) would
+// tell the customer their card was refused.
+func asUnavailable(err error) error {
+	if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
+		return fmt.Errorf("%w: circuit open", ErrUnavailable)
+	}
+	return err
+}
+
 func retry[T any](ctx context.Context, attempts int, fn func() (T, error)) (T, error) {
 	var out T
 	var err error
@@ -118,26 +129,29 @@ func retry[T any](ctx context.Context, attempts int, fn func() (T, error)) (T, e
 
 func (r *resilientProcessor) Authorize(ctx context.Context, paymentID string, amount int64, currency, token string) (AuthResult, error) {
 	return retry(ctx, 3, func() (AuthResult, error) {
-		return r.breaker.Execute(func() (AuthResult, error) {
+		out, err := r.breaker.Execute(func() (AuthResult, error) {
 			return r.inner.Authorize(ctx, paymentID, amount, currency, token)
 		})
+		return out, asUnavailable(err)
 	})
 }
 
 func (r *resilientProcessor) Capture(ctx context.Context, ref string) error {
 	_, err := retry(ctx, 3, func() (struct{}, error) {
-		return r.plain.Execute(func() (struct{}, error) {
+		out, err := r.plain.Execute(func() (struct{}, error) {
 			return struct{}{}, r.inner.Capture(ctx, ref)
 		})
+		return out, asUnavailable(err)
 	})
 	return err
 }
 
 func (r *resilientProcessor) Reverse(ctx context.Context, ref string) error {
 	_, err := retry(ctx, 3, func() (struct{}, error) {
-		return r.plain.Execute(func() (struct{}, error) {
+		out, err := r.plain.Execute(func() (struct{}, error) {
 			return struct{}{}, r.inner.Reverse(ctx, ref)
 		})
+		return out, asUnavailable(err)
 	})
 	return err
 }

@@ -152,6 +152,85 @@ func (e *Engine) CompleteFromGateway(ctx context.Context, paymentID uuid.UUID, a
 	return nil
 }
 
+// ErrNotResumable means the payment is not parked awaiting step-up, so there is
+// nothing for a resume to do.
+var ErrNotResumable = errors.New("payment is not awaiting step-up")
+
+// ResumeAfterStepUp re-drives a payment parked at requires_action once the caller
+// has proven a second factor. Idempotent: a payment in any other state is
+// rejected rather than re-driven, so a replayed resume cannot double-charge.
+func (e *Engine) ResumeAfterStepUp(ctx context.Context, paymentID, userID uuid.UUID) error {
+	p, err := e.load(ctx, paymentID)
+	if err != nil {
+		return err
+	}
+	// Never confirm another user's payment exists, and never resume a payment
+	// that is not actually waiting on the challenge.
+	if p.UserID != userID || p.Status != "requires_action" {
+		return ErrNotResumable
+	}
+	// Fraud already screened it and asked for step-up; resume at the next step
+	// rather than re-screening, which would only ask for it again.
+	if err := e.transition(ctx, p, "fraud_screened", "processing", nil); err != nil {
+		return err
+	}
+	go e.Advance(context.WithoutCancel(ctx), p.ID)
+	return nil
+}
+
+// ExpireStaleRequiresAction fails payments whose step-up was never completed.
+// No funds are held at this point (the hold comes after fraud screening), so
+// expiry is a clean terminal transition with nothing to compensate.
+func (e *Engine) ExpireStaleRequiresAction(ctx context.Context, timeout time.Duration) {
+	tag, err := e.pool.Exec(ctx,
+		`update payments
+		    set status = 'failed', step = 'done',
+		        failure_code = 'step_up_expired',
+		        failure_detail = 'second factor was not completed in time',
+		        updated_at = now()
+		  where status = 'requires_action' and updated_at < now() - $1::interval`,
+		timeout.String())
+	if err != nil {
+		e.log.Error("requires_action expiry failed", "error", err)
+		return
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		e.log.Warn("expired payments awaiting step-up", "count", n, "timeout", timeout)
+	}
+}
+
+// ExpireStuckSubmissions bounds the gateway-retry loop. A payment that cannot
+// reach the processor stays retryable (see stepSubmit) instead of being falsely
+// declined, but it must not retry forever: past the timeout it fails and the
+// hold is released.
+func (e *Engine) ExpireStuckSubmissions(ctx context.Context, timeout time.Duration) {
+	rows, err := e.pool.Query(ctx,
+		`select id from payments
+		  where status = 'processing' and step = 'funds_held'
+		    and updated_at < now() - $1::interval
+		  limit 20`, timeout.String())
+	if err != nil {
+		e.log.Error("stuck-submission scan failed", "error", err)
+		return
+	}
+	ids := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		p, err := e.load(ctx, id)
+		if err != nil {
+			continue
+		}
+		e.log.Warn("gateway unreachable past timeout — compensating", "payment_id", id, "timeout", timeout)
+		e.failAndCompensate(ctx, p, "gateway_unavailable", "processor unreachable past the submission timeout")
+	}
+}
+
 // ExpireStaleWallets fails wallet payments whose processor never reported an
 // outcome. Without this an abandoned wallet authorization sits at
 // submitted_to_gateway forever with the funds held, until the account-service
@@ -260,7 +339,12 @@ func (e *Engine) stepSubmit(ctx context.Context, p *Payment) bool {
 	result, err := processor.Authorize(ctx, p.ID.String(), p.Amount, p.Currency, p.Token)
 	if err != nil {
 		if errors.Is(err, psp.ErrUnavailable) || errors.Is(err, context.DeadlineExceeded) {
-			e.failAndCompensate(ctx, p, "gateway_unavailable", "processor unreachable after retries")
+			// Unreachable is NOT declined. Leave the payment retryable and let the
+			// resume sweeper try again with the same idempotent gateway reference;
+			// ExpireStuckSubmissions fails it if the processor stays down. Failing
+			// here would turn a brief PSP blip into a permanent customer decline.
+			e.log.Warn("gateway unavailable — will retry", "payment_id", p.ID, "error", err)
+			e.touch(ctx, p.ID)
 			return false
 		}
 		e.failAndCompensate(ctx, p, "gateway_declined", err.Error())
@@ -324,6 +408,15 @@ func (e *Engine) stepCapture(ctx context.Context, p *Payment) bool {
 }
 
 // ── persistence helpers ──────────────────────────────────────────────────────
+
+// touch bumps updated_at so a payment that just failed an attempt is not
+// re-picked by ResumeStale on the very next tick — the retry backs off by the
+// sweeper's staleness window instead of hot-looping against a dead processor.
+func (e *Engine) touch(ctx context.Context, id uuid.UUID) {
+	if _, err := e.pool.Exec(ctx, `update payments set updated_at = now() where id = $1`, id); err != nil {
+		e.log.Error("touch failed", "payment_id", id, "error", err)
+	}
+}
 
 func (e *Engine) load(ctx context.Context, id uuid.UUID) (*Payment, error) {
 	p := &Payment{}

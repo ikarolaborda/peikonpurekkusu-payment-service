@@ -31,11 +31,16 @@ type Server struct {
 	quoteTTL time.Duration
 	kafkaOK func() bool
 	log     *slog.Logger
+
+	stepUpAmountLimit int64
+	stepUpMaxAge      time.Duration
 }
 
 func New(pool *pgxpool.Pool, idem *idempotency.Store, engine *saga.Engine, bus *pubsub.Bus,
-	quoteTTL time.Duration, kafkaOK func() bool, log *slog.Logger) *Server {
-	return &Server{pool: pool, idem: idem, engine: engine, bus: bus, quoteTTL: quoteTTL, kafkaOK: kafkaOK, log: log}
+	quoteTTL time.Duration, stepUpAmountLimit int64, stepUpMaxAge time.Duration,
+	kafkaOK func() bool, log *slog.Logger) *Server {
+	return &Server{pool: pool, idem: idem, engine: engine, bus: bus, quoteTTL: quoteTTL,
+		stepUpAmountLimit: stepUpAmountLimit, stepUpMaxAge: stepUpMaxAge, kafkaOK: kafkaOK, log: log}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -47,6 +52,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /payments", s.createPayment)
 	mux.HandleFunc("GET /payments/instruments", s.listInstruments)
 	mux.HandleFunc("POST /payments/fx-quote", s.fxQuote)
+	mux.HandleFunc("POST /payments/{id}/resume", s.resumePayment)
 	mux.HandleFunc("GET /payments/{id}", s.getPayment)
 	mux.HandleFunc("GET /payments/{id}/events", s.streamEvents)
 	mux.HandleFunc("GET /payments/merchants", s.listMerchants)
@@ -92,6 +98,18 @@ func (s *Server) createPayment(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	if err != nil {
 		httpError(w, http.StatusBadRequest, "unreadable body")
+		return
+	}
+
+	// Gate before claiming the idempotency key: a rejected request must not burn
+	// the caller's key, so retrying after the challenge reuses it cleanly.
+	var probe struct {
+		Amount struct {
+			MinorUnits int64 `json:"amount_minor_units"`
+		} `json:"amount"`
+	}
+	if err := json.Unmarshal(body, &probe); err == nil && s.stepUpRequired(r, probe.Amount.MinorUnits) {
+		writeJSON(w, http.StatusUnauthorized, problem("step_up_required: this amount requires a recent second factor"))
 		return
 	}
 
@@ -184,6 +202,38 @@ func (s *Server) executeCreate(ctx context.Context, userID uuid.UUID, body []byt
 			"currency_code":      req.Amount.CurrencyCode,
 		},
 		"merchant_id": req.MerchantID,
+	}
+}
+
+// resumePayment re-drives a payment that fraud parked at requires_action, once
+// the caller has actually completed the step-up it asked for. Without this the
+// payment would sit in requires_action forever: no sweeper resumes it, and the
+// customer has no way to satisfy the challenge.
+func (s *Server) resumePayment(w http.ResponseWriter, r *http.Request) {
+	userID, err := uuid.Parse(r.Header.Get("X-User-Id"))
+	if err != nil {
+		httpError(w, http.StatusUnauthorized, "missing identity")
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "invalid payment id")
+		return
+	}
+	// The whole point of the pause is the second factor — resuming without a
+	// fresh one would make requires_action decorative.
+	auth := readAuthStrength(r)
+	if !auth.steppedUp() || !auth.fresh(s.stepUpMaxAge) {
+		writeJSON(w, http.StatusUnauthorized, problem("step_up_required: complete a recent second factor to resume this payment"))
+		return
+	}
+	switch err := s.engine.ResumeAfterStepUp(r.Context(), id, userID); {
+	case errors.Is(err, saga.ErrNotResumable):
+		httpError(w, http.StatusConflict, "payment is not awaiting step-up")
+	case err != nil:
+		s.fail(w, "resume payment", err)
+	default:
+		writeJSON(w, http.StatusAccepted, map[string]any{"id": id.String(), "status": "processing"})
 	}
 }
 

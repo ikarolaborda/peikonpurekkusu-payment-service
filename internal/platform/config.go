@@ -32,6 +32,17 @@ type Config struct {
 	FxQuoteTTL     time.Duration
 	ResumeInterval time.Duration
 	WalletTimeout  time.Duration
+
+	// Step-up policy: a payment at or above the limit, or one made on a session
+	// whose last authentication is older than StepUpMaxAge, demands a second
+	// factor (amr must contain "mfa"). An old-but-valid token cannot move money.
+	StepUpAmountLimit int64
+	StepUpMaxAge      time.Duration
+
+	// A payment stuck waiting for step-up, or unable to reach the gateway, is
+	// failed once it passes these — nothing may wedge forever.
+	RequiresActionTimeout time.Duration
+	GatewaySubmitTimeout  time.Duration
 }
 
 func Load() (Config, error) {
@@ -52,6 +63,11 @@ func Load() (Config, error) {
 		FxQuoteTTL:         getdur("FX_QUOTE_TTL", 90*time.Second),
 		ResumeInterval:     getdur("SAGA_RESUME_INTERVAL", 15*time.Second),
 		WalletTimeout:      getdur("WALLET_RESULT_TIMEOUT", 10*time.Minute),
+
+		StepUpAmountLimit:     getint64("STEPUP_AMOUNT_LIMIT", 100_000),
+		StepUpMaxAge:          getdur("STEPUP_MAX_AGE", 15*time.Minute),
+		RequiresActionTimeout: getdur("REQUIRES_ACTION_TIMEOUT", 15*time.Minute),
+		GatewaySubmitTimeout:  getdur("GATEWAY_SUBMIT_TIMEOUT", 5*time.Minute),
 	}
 	if cfg.DBUser == "" || cfg.DBPassword == "" || cfg.DBName == "" {
 		return cfg, fmt.Errorf("PAYMENT_DB_USER/PASSWORD/NAME are required")

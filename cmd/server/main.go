@@ -99,6 +99,8 @@ func run(log *slog.Logger) error {
 	idem := idempotency.NewStore(pool)
 	go every(ctx, cfg.ResumeInterval, func() { engine.ResumeStale(ctx, 30*time.Second) })
 	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStaleWallets(ctx, cfg.WalletTimeout) })
+	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStaleRequiresAction(ctx, cfg.RequiresActionTimeout) })
+	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStuckSubmissions(ctx, cfg.GatewaySubmitTimeout) })
 	go every(ctx, time.Hour, func() {
 		if n, err := idem.Purge(ctx); err == nil && n > 0 {
 			log.Info("idempotency keys purged", "count", n)
@@ -112,7 +114,7 @@ func run(log *slog.Logger) error {
 	}
 	httpSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler:           httpapi.New(pool, idem, engine, bus, cfg.FxQuoteTTL, kafkaOK, log).Handler(),
+		Handler:           httpapi.New(pool, idem, engine, bus, cfg.FxQuoteTTL, cfg.StepUpAmountLimit, cfg.StepUpMaxAge, kafkaOK, log).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      0, // SSE endpoints stream indefinitely

@@ -24,6 +24,10 @@ var (
 
 const keyTTL = 24 * time.Hour
 
+// lockLease bounds how long a claimed-but-uncompleted key blocks a retry. A
+// request that dies mid-flight must not hold its key hostage for the full TTL.
+const lockLease = 2 * time.Minute
+
 type Store struct {
 	pool *pgxpool.Pool
 }
@@ -75,6 +79,23 @@ func (s *Store) Begin(ctx context.Context, userID uuid.UUID, key, requestHash st
 		return nil, ErrPayloadMismatch
 	}
 	if code == nil {
+		// Claimed but never completed. If the claimer died mid-request the row
+		// would otherwise pin this key to 409 for its whole 24h TTL, so a lock
+		// older than the lease is reclaimable. The CAS on locked_at means only
+		// one of several racing reclaimers wins; a completed key (response_code
+		// set) is never taken over.
+		tag, err := s.pool.Exec(ctx, `
+			update idempotency_keys
+			   set locked_at = now()
+			 where user_id=$1 and key=$2
+			   and response_code is null
+			   and locked_at < now() - $3::interval`, userID, key, lockLease.String())
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() == 1 {
+			return nil, nil // lease taken over — caller re-executes
+		}
 		return nil, ErrInFlight
 	}
 	return &Replay{Code: *code, Body: body}, nil
