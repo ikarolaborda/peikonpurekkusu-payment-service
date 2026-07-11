@@ -19,7 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	fraudv1 "github.com/peikonpurekkusu/contracts/gen/go/fraud/v1"
+	fraudv1 "github.com/ikarolaborda/peikonpurekkusu-contracts/gen/go/fraud/v1"
 	"github.com/peikonpurekkusu/payment-service/internal/accountclient"
 	"github.com/peikonpurekkusu/payment-service/internal/fraudclient"
 	"github.com/peikonpurekkusu/payment-service/internal/psp"

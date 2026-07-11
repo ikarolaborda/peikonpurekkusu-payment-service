@@ -10,7 +10,7 @@ import (
 	"log/slog"
 	"time"
 
-	fraudv1 "github.com/peikonpurekkusu/contracts/gen/go/fraud/v1"
+	fraudv1 "github.com/ikarolaborda/peikonpurekkusu-contracts/gen/go/fraud/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

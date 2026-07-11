@@ -7,7 +7,7 @@ import (
 	"context"
 	"time"
 
-	accountv1 "github.com/peikonpurekkusu/contracts/gen/go/account/v1"
+	accountv1 "github.com/ikarolaborda/peikonpurekkusu-contracts/gen/go/account/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
