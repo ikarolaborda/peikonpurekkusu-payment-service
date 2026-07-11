@@ -44,6 +44,12 @@ type Config struct {
 	RequiresActionTimeout time.Duration
 	GatewaySubmitTimeout  time.Duration
 	GatewayCaptureTimeout time.Duration
+
+	// Settlement reconciliation: how often to compare our books against the
+	// processor's report, and how long a capture may be settled-but-unbooked
+	// before it counts as drift rather than a payment still in flight.
+	ReconcileInterval time.Duration
+	ReconcileGrace    time.Duration
 }
 
 func Load() (Config, error) {
@@ -70,6 +76,8 @@ func Load() (Config, error) {
 		RequiresActionTimeout: getdur("REQUIRES_ACTION_TIMEOUT", 15*time.Minute),
 		GatewaySubmitTimeout:  getdur("GATEWAY_SUBMIT_TIMEOUT", 5*time.Minute),
 		GatewayCaptureTimeout: getdur("GATEWAY_CAPTURE_TIMEOUT", 5*time.Minute),
+		ReconcileInterval:     getdur("RECONCILE_INTERVAL", 60*time.Second),
+		ReconcileGrace:        getdur("RECONCILE_GRACE", 60*time.Second),
 	}
 	if cfg.DBUser == "" || cfg.DBPassword == "" || cfg.DBName == "" {
 		return cfg, fmt.Errorf("PAYMENT_DB_USER/PASSWORD/NAME are required")

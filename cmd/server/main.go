@@ -103,6 +103,8 @@ func run(log *slog.Logger) error {
 	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStuckSubmissions(ctx, cfg.GatewaySubmitTimeout) })
 	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStuckCaptures(ctx, cfg.GatewayCaptureTimeout) })
 	go every(ctx, time.Minute, func() { engine.AlertStalledLedgerCaptures(ctx, 2*time.Minute) })
+	reconciler := saga.NewReconciler(engine, cfg.MockPSPBaseURL, cfg.ReconcileGrace)
+	go every(ctx, cfg.ReconcileInterval, func() { reconciler.Run(ctx) })
 	go every(ctx, time.Hour, func() {
 		if n, err := idem.Purge(ctx); err == nil && n > 0 {
 			log.Info("idempotency keys purged", "count", n)
