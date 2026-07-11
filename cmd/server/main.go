@@ -105,6 +105,7 @@ func run(log *slog.Logger) error {
 	go every(ctx, time.Minute, func() { engine.AlertStalledLedgerCaptures(ctx, 2*time.Minute) })
 	reconciler := saga.NewReconciler(engine, cfg.MockPSPBaseURL, cfg.ReconcileGrace)
 	go every(ctx, cfg.ReconcileInterval, func() { reconciler.Run(ctx) })
+	go func() { reconciler.Run(ctx) }() // first pass immediately, not a minute after boot
 	go every(ctx, time.Hour, func() {
 		if n, err := idem.Purge(ctx); err == nil && n > 0 {
 			log.Info("idempotency keys purged", "count", n)
@@ -118,7 +119,7 @@ func run(log *slog.Logger) error {
 	}
 	httpSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler:           httpapi.New(pool, idem, engine, bus, cfg.FxQuoteTTL, cfg.StepUpAmountLimit, cfg.StepUpMaxAge, kafkaOK, log).Handler(),
+		Handler:           httpapi.New(pool, idem, engine, bus, cfg.FxQuoteTTL, cfg.StepUpAmountLimit, cfg.StepUpMaxAge, kafkaOK, log).WithReconciler(reconciler).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      0, // SSE endpoints stream indefinitely

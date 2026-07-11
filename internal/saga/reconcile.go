@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -25,6 +26,39 @@ type Reconciler struct {
 	// mid-flight is legitimately settled-but-not-yet-booked for a moment; without
 	// a grace window the reconciler would cry drift on every healthy payment.
 	grace time.Duration
+
+	mu   sync.RWMutex
+	last Snapshot
+}
+
+// Snapshot is the last reconciliation result, exposed so the outcome is a
+// queryable signal and not merely a line in a log nobody reads.
+type Snapshot struct {
+	Status           string `json:"status"` // clean | drift_detected | coverage_gap | unavailable
+	RanAt            string `json:"ran_at"`
+	ReportSince      string `json:"report_since"`
+	SettledNotBooked int    `json:"settled_not_booked"`
+	BookedNotSettled int    `json:"booked_not_settled"`
+	DoubleSettled    int    `json:"double_settled"`
+	// Captures we booked before the processor's report begins. They cannot be
+	// checked at all, so real drift among them is INVISIBLE to this job. Surfaced
+	// as its own condition rather than a footnote, because a blind spot that gets
+	// normalised as background noise is how the one alert that matters gets missed.
+	OutOfCoverage int    `json:"out_of_coverage_bookings"`
+	Detail        string `json:"detail,omitempty"`
+}
+
+func (r *Reconciler) Snapshot() Snapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.last
+}
+
+func (r *Reconciler) record(s Snapshot) {
+	s.RanAt = time.Now().UTC().Format(time.RFC3339)
+	r.mu.Lock()
+	r.last = s
+	r.mu.Unlock()
 }
 
 func NewReconciler(engine *Engine, pspBaseURL string, grace time.Duration) *Reconciler {
@@ -58,6 +92,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 	report, err := r.fetchSettlement(ctx)
 	if err != nil {
 		r.engine.log.Error("reconciliation: settlement report unavailable", "error", err)
+		r.record(Snapshot{Status: "unavailable", Detail: err.Error()})
 		return
 	}
 	settled := report.Captures
@@ -65,12 +100,14 @@ func (r *Reconciler) Run(ctx context.Context) {
 	coverageFrom, err := time.Parse(time.RFC3339, report.ReportSince)
 	if err != nil {
 		r.engine.log.Error("reconciliation: settlement report has no usable coverage period", "error", err)
+		r.record(Snapshot{Status: "unavailable", Detail: "unusable report_since"})
 		return
 	}
 
 	booked, outOfScope, err := r.bookedReferences(ctx, coverageFrom)
 	if err != nil {
 		r.engine.log.Error("reconciliation: could not read booked captures", "error", err)
+		r.record(Snapshot{Status: "unavailable", Detail: err.Error()})
 		return
 	}
 
@@ -110,20 +147,38 @@ func (r *Reconciler) Run(ctx context.Context) {
 			// capture reordering is supposed to make this impossible, so it is not a
 			// warning — it is an alarm on a broken invariant.
 			bookedNotSettled++
-			r.engine.log.Error("reconciliation: BOOKED BUT NEVER SETTLED — capture-ordering invariant violated",
+			r.engine.log.Error("reconciliation: BOOKED BUT NEVER SETTLED — violates the capture-ordering assumption",
 				"psp_reference", ref)
 		}
 	}
 
-	if settledNotBooked == 0 && bookedNotSettled == 0 && doubleSettled == 0 {
-		r.engine.log.Info("reconciliation clean",
-			"settled", len(settled), "booked_in_scope", len(booked), "outside_report_coverage", outOfScope)
-		return
+	snap := Snapshot{
+		ReportSince:      report.ReportSince,
+		SettledNotBooked: settledNotBooked,
+		BookedNotSettled: bookedNotSettled,
+		DoubleSettled:    doubleSettled,
+		OutOfCoverage:    outOfScope,
 	}
-	r.engine.log.Error("reconciliation found drift",
-		"settled_not_booked", settledNotBooked,
-		"booked_not_settled", bookedNotSettled,
-		"double_settled", doubleSettled)
+
+	switch {
+	case settledNotBooked > 0 || bookedNotSettled > 0 || doubleSettled > 0:
+		snap.Status = "drift_detected"
+		r.engine.log.Error("reconciliation found drift",
+			"settled_not_booked", settledNotBooked,
+			"booked_not_settled", bookedNotSettled,
+			"double_settled", doubleSettled,
+			"out_of_coverage_bookings", outOfScope)
+	case outOfScope > 0:
+		// Not clean: these bookings predate the processor's report, so drift among
+		// them cannot be seen at all. Saying "clean" here would be a lie of omission.
+		snap.Status = "coverage_gap"
+		r.engine.log.Warn("reconciliation cannot see all bookings — settlement report starts after them",
+			"out_of_coverage_bookings", outOfScope, "report_since", report.ReportSince)
+	default:
+		snap.Status = "clean"
+		r.engine.log.Info("reconciliation clean", "settled", len(settled), "booked_in_scope", len(booked))
+	}
+	r.record(snap)
 }
 
 func (r *Reconciler) fetchSettlement(ctx context.Context) (settlementReport, error) {

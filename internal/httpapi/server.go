@@ -24,16 +24,23 @@ import (
 )
 
 type Server struct {
-	pool    *pgxpool.Pool
-	idem    *idempotency.Store
-	engine  *saga.Engine
-	bus     *pubsub.Bus
+	pool     *pgxpool.Pool
+	idem     *idempotency.Store
+	engine   *saga.Engine
+	bus      *pubsub.Bus
 	quoteTTL time.Duration
-	kafkaOK func() bool
-	log     *slog.Logger
+	kafkaOK  func() bool
+	log      *slog.Logger
 
 	stepUpAmountLimit int64
 	stepUpMaxAge      time.Duration
+	reconciler        *saga.Reconciler
+}
+
+// WithReconciler exposes the settlement-reconciliation result over HTTP.
+func (s *Server) WithReconciler(r *saga.Reconciler) *Server {
+	s.reconciler = r
+	return s
 }
 
 func New(pool *pgxpool.Pool, idem *idempotency.Store, engine *saga.Engine, bus *pubsub.Bus,
@@ -49,6 +56,9 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("GET /health/ready", s.ready)
+	// Reconciliation is a money-integrity signal, so it gets a surface an operator
+	// (or a monitor) can actually query — a log line alone is a signal nobody sees.
+	mux.HandleFunc("GET /health/reconciliation", s.reconciliation)
 	mux.HandleFunc("POST /payments", s.createPayment)
 	mux.HandleFunc("GET /payments/instruments", s.listInstruments)
 	mux.HandleFunc("POST /payments/fx-quote", s.fxQuote)
@@ -57,6 +67,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /payments/{id}/events", s.streamEvents)
 	mux.HandleFunc("GET /payments/merchants", s.listMerchants)
 	return mux
+}
+
+func (s *Server) reconciliation(w http.ResponseWriter, _ *http.Request) {
+	if s.reconciler == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "disabled"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.reconciler.Snapshot())
 }
 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
@@ -267,14 +285,14 @@ func (s *Server) getPayment(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": pid, "status": status, "step": step,
-		"amount":        map[string]any{"amount_minor_units": amount, "currency_code": currency},
-		"merchant_id":   merchantID,
-		"merchant_name": merchantName,
-		"instrument_id": instrumentID.String(),
-		"failure_code":  failureCode,
+		"amount":         map[string]any{"amount_minor_units": amount, "currency_code": currency},
+		"merchant_id":    merchantID,
+		"merchant_name":  merchantName,
+		"instrument_id":  instrumentID.String(),
+		"failure_code":   failureCode,
 		"failure_detail": failureDetail,
-		"psp_reference": pspRef,
-		"created_at":    createdAt, "updated_at": updatedAt,
+		"psp_reference":  pspRef,
+		"created_at":     createdAt, "updated_at": updatedAt,
 	})
 }
 
