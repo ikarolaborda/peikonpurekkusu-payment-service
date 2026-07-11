@@ -127,24 +127,62 @@ func (e *Engine) ResumeStale(ctx context.Context, olderThan time.Duration) {
 }
 
 // CompleteFromGateway is called by the Kafka consumer when an async processor
-// (wallet) reports its outcome.
-func (e *Engine) CompleteFromGateway(ctx context.Context, paymentID uuid.UUID, approved bool, pspRef, declineCode string) {
+// (wallet) reports its outcome. It returns an error when the outcome could not
+// be durably applied, so the caller can redeliver rather than mark the event
+// consumed — a swallowed failure here strands the payment with funds held.
+func (e *Engine) CompleteFromGateway(ctx context.Context, paymentID uuid.UUID, approved bool, pspRef, declineCode string) error {
 	p, err := e.load(ctx, paymentID)
-	if err != nil || p.Status != "processing" || p.Step != "submitted_to_gateway" {
-		return
+	if err != nil {
+		return fmt.Errorf("load payment %s: %w", paymentID, err)
+	}
+	if p.Status != "processing" || p.Step != "submitted_to_gateway" {
+		return nil // already resolved — a duplicate delivery, not a failure
 	}
 	if approved {
 		if err := e.transition(ctx, p, "submitted_to_gateway", "processing", func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `update payments set psp_reference=$2 where id=$1`, p.ID, pspRef)
 			return err
 		}); err != nil {
-			e.log.Error("gateway completion persist failed", "payment_id", p.ID, "error", err)
-			return
+			return fmt.Errorf("gateway completion persist: %w", err)
 		}
 		e.Advance(ctx, p.ID)
-		return
+		return nil
 	}
 	e.failAndCompensate(ctx, p, "gateway_declined", declineCode)
+	return nil
+}
+
+// ExpireStaleWallets fails wallet payments whose processor never reported an
+// outcome. Without this an abandoned wallet authorization sits at
+// submitted_to_gateway forever with the funds held, until the account-service
+// hold sweeper expires it days later and a late completion can no longer capture.
+func (e *Engine) ExpireStaleWallets(ctx context.Context, timeout time.Duration) {
+	rows, err := e.pool.Query(ctx,
+		`select id from payments
+		  where status = 'processing' and step = 'submitted_to_gateway'
+		    and method = 'wallet' and psp_reference is null
+		    and updated_at < now() - $1::interval
+		  limit 20`, timeout.String())
+	if err != nil {
+		e.log.Error("wallet expiry scan failed", "error", err)
+		return
+	}
+	ids := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		p, err := e.load(ctx, id)
+		if err != nil {
+			continue
+		}
+		e.log.Warn("wallet completion timed out — compensating", "payment_id", id, "timeout", timeout)
+		e.failAndCompensate(ctx, p, "gateway_timeout", "wallet processor did not report an outcome")
+	}
 }
 
 // WriteRequestedEvent records payments.payment.requested.v1 in the caller's

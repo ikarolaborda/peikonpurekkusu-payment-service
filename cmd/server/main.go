@@ -98,6 +98,7 @@ func run(log *slog.Logger) error {
 
 	idem := idempotency.NewStore(pool)
 	go every(ctx, cfg.ResumeInterval, func() { engine.ResumeStale(ctx, 30*time.Second) })
+	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStaleWallets(ctx, cfg.WalletTimeout) })
 	go every(ctx, time.Hour, func() {
 		if n, err := idem.Purge(ctx); err == nil && n > 0 {
 			log.Info("idempotency keys purged", "count", n)
