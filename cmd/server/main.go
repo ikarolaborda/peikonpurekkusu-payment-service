@@ -89,7 +89,8 @@ func run(log *slog.Logger) error {
 	bus := pubsub.New()
 	engine := saga.NewEngine(pool, outbox.Writer{}, fraud, accounts, psp.NewFactory(cfg.MockPSPBaseURL), bus, log)
 
-	cons, err := consumer.New(pool, engine, splitCSV(cfg.KafkaBootstrap), producer, log)
+	validator := events.NewValidator(cfg.SchemaRegistryURL)
+	cons, err := consumer.New(pool, engine, splitCSV(cfg.KafkaBootstrap), producer, validator, log)
 	if err != nil {
 		return fmt.Errorf("kafka consumer: %w", err)
 	}

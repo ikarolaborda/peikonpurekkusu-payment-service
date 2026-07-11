@@ -25,14 +25,16 @@ const (
 )
 
 type Consumer struct {
-	pool     *pgxpool.Pool
-	engine   *saga.Engine
-	client   *kgo.Client
-	producer *kgo.Client
-	log      *slog.Logger
+	pool      *pgxpool.Pool
+	engine    *saga.Engine
+	client    *kgo.Client
+	producer  *kgo.Client
+	validator *events.Validator
+	log       *slog.Logger
 }
 
-func New(pool *pgxpool.Pool, engine *saga.Engine, bootstrap []string, producer *kgo.Client, log *slog.Logger) (*Consumer, error) {
+func New(pool *pgxpool.Pool, engine *saga.Engine, bootstrap []string, producer *kgo.Client,
+	validator *events.Validator, log *slog.Logger) (*Consumer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(bootstrap...),
 		kgo.ConsumerGroup(group),
@@ -42,7 +44,7 @@ func New(pool *pgxpool.Pool, engine *saga.Engine, bootstrap []string, producer *
 	if err != nil {
 		return nil, err
 	}
-	return &Consumer{pool: pool, engine: engine, client: client, producer: producer, log: log}, nil
+	return &Consumer{pool: pool, engine: engine, client: client, producer: producer, validator: validator, log: log}, nil
 }
 
 func (c *Consumer) Close() { c.client.Close() }
@@ -101,6 +103,27 @@ func (c *Consumer) handleWithRetry(ctx context.Context, rec *kgo.Record) bool {
 }
 
 func (c *Consumer) handle(ctx context.Context, rec *kgo.Record) error {
+	// Validate against the exact schema the producer framed with, BEFORE any
+	// field is read. Registry outage blocks HERE: franz-go commits per batch,
+	// so returning "unsettled" would let the next successful batch commit past
+	// this record — blocking inside the handler is what holds the offset.
+	for {
+		err := c.validator.Validate(ctx, rec.Value)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, events.ErrRegistryUnavailable) {
+			c.log.Warn("schema registry unavailable — holding", "topic", rec.Topic, "offset", rec.Offset)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		return poison(err)
+	}
+
 	env, err := events.Unframe(rec.Value)
 	if err != nil {
 		return poison(err)
@@ -123,11 +146,17 @@ func (c *Consumer) handle(ctx context.Context, rec *kgo.Record) error {
 		return nil
 	}
 
+	// Validation guarantees outcome (schema-required); the check is the
+	// backstop that keeps a bypass from reading "" and calling it a decline.
+	outcome := str(env.Payload["outcome"])
+	if outcome == "" {
+		return poison(fmt.Errorf("payload missing 'outcome'"))
+	}
+
 	// Effect first, mark second. CompleteFromGateway is idempotent (it re-loads
 	// the payment and only acts on step='submitted_to_gateway'), so a crash
 	// before the mark redelivers harmlessly. Marking first would strand the
 	// payment: the redelivery would be skipped and the hold would never resolve.
-	outcome := str(env.Payload["outcome"])
 	if err := c.engine.CompleteFromGateway(ctx, paymentID,
 		outcome == "approved", str(env.Payload["psp_reference"]), str(env.Payload["decline_code"])); err != nil {
 		return err

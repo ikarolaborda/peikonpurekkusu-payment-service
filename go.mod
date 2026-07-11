@@ -7,6 +7,7 @@ require (
 	github.com/ikarolaborda/peikonpurekkusu-contracts/gen/go v1.0.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pressly/goose/v3 v3.27.2
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/sony/gobreaker/v2 v2.4.0
 	github.com/twmb/franz-go v1.21.5
 	google.golang.org/grpc v1.80.0
