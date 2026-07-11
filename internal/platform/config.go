@@ -43,6 +43,7 @@ type Config struct {
 	// failed once it passes these — nothing may wedge forever.
 	RequiresActionTimeout time.Duration
 	GatewaySubmitTimeout  time.Duration
+	GatewayCaptureTimeout time.Duration
 }
 
 func Load() (Config, error) {
@@ -68,6 +69,7 @@ func Load() (Config, error) {
 		StepUpMaxAge:          getdur("STEPUP_MAX_AGE", 15*time.Minute),
 		RequiresActionTimeout: getdur("REQUIRES_ACTION_TIMEOUT", 15*time.Minute),
 		GatewaySubmitTimeout:  getdur("GATEWAY_SUBMIT_TIMEOUT", 5*time.Minute),
+		GatewayCaptureTimeout: getdur("GATEWAY_CAPTURE_TIMEOUT", 5*time.Minute),
 	}
 	if cfg.DBUser == "" || cfg.DBPassword == "" || cfg.DBName == "" {
 		return cfg, fmt.Errorf("PAYMENT_DB_USER/PASSWORD/NAME are required")

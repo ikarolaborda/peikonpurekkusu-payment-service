@@ -89,10 +89,12 @@ func (e *Engine) Advance(ctx context.Context, paymentID uuid.UUID) {
 		case "submitted_to_gateway":
 			// Card payments continue inline (authorization already resolved);
 			// wallet payments wait here for gateway.psp.completed.v1.
-			if p.Method == "wallet" && p.PSPReference == nil {
+			if p.PSPReference == nil {
 				return
 			}
-			next = e.stepCapture(ctx, p)
+			next = e.stepPSPCapture(ctx, p)
+		case "psp_captured":
+			next = e.stepLedgerCapture(ctx, p)
 		default:
 			return
 		}
@@ -228,6 +230,62 @@ func (e *Engine) ExpireStuckSubmissions(ctx context.Context, timeout time.Durati
 		}
 		e.log.Warn("gateway unreachable past timeout — compensating", "payment_id", id, "timeout", timeout)
 		e.failAndCompensate(ctx, p, "gateway_unavailable", "processor unreachable past the submission timeout")
+	}
+}
+
+// ExpireStuckCaptures bounds the wait for a processor that will not confirm the
+// capture. It scans ONLY payments whose PSP capture has not been confirmed
+// (step is still submitted_to_gateway), where the hold is intact and no ledger
+// movement has happened — so releasing the hold is a clean, complete correction.
+//
+// It deliberately cannot see step='psp_captured': releasing a hold after the
+// processor has taken the money would refund the customer money we no longer
+// hold, which is the very divergence this reordering exists to prevent.
+func (e *Engine) ExpireStuckCaptures(ctx context.Context, timeout time.Duration) {
+	rows, err := e.pool.Query(ctx,
+		`select id from payments
+		  where status = 'processing' and step = 'submitted_to_gateway'
+		    and psp_reference is not null
+		    and updated_at < now() - $1::interval
+		  limit 20`, timeout.String())
+	if err != nil {
+		e.log.Error("stuck-capture scan failed", "error", err)
+		return
+	}
+	ids := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		p, err := e.load(ctx, id)
+		if err != nil {
+			continue
+		}
+		e.log.Warn("processor never confirmed the capture — releasing hold", "payment_id", id, "timeout", timeout)
+		e.failAndCompensate(ctx, p, "gateway_capture_failed", "processor did not confirm the capture in time")
+	}
+}
+
+// AlertStalledLedgerCaptures surfaces the one residual of capturing at the
+// processor first: it has the money and our ledger has not recorded it yet.
+// This state is never auto-compensated — it is retried until it lands — so the
+// only correct action here is to make it loud rather than let it sit silently.
+func (e *Engine) AlertStalledLedgerCaptures(ctx context.Context, olderThan time.Duration) {
+	var count int
+	if err := e.pool.QueryRow(ctx,
+		`select count(*) from payments
+		  where status = 'processing' and step = 'psp_captured'
+		    and updated_at < now() - $1::interval`, olderThan.String()).Scan(&count); err != nil {
+		e.log.Error("stalled ledger-capture scan failed", "error", err)
+		return
+	}
+	if count > 0 {
+		e.log.Error("PSP captured but the ledger has not recorded it — money is collected and unbooked",
+			"count", count, "older_than", olderThan)
 	}
 }
 
@@ -376,18 +434,59 @@ func (e *Engine) stepSubmit(ctx context.Context, p *Payment) bool {
 	}
 }
 
-func (e *Engine) stepCapture(ctx context.Context, p *Payment) bool {
+// stepPSPCapture takes the money at the processor BEFORE the ledger records it.
+//
+// The ledger is our record of what happened to the money, so posting a capture
+// the processor has not confirmed asserts a fact that has not occurred. Doing it
+// the other way round (the previous behaviour) meant a failed PSP capture left
+// the merchant credited and the customer told "succeeded" for money the card
+// network never collected — a silent, permanent divergence.
+//
+// Capturing first also makes compensation trivial: if the processor refuses, no
+// ledger movement has happened, so releasing the still-active hold is the whole
+// of the correction.
+func (e *Engine) stepPSPCapture(ctx context.Context, p *Payment) bool {
+	processor, err := e.psps.For(p.Method)
+	if err != nil {
+		e.failAndCompensate(ctx, p, "gateway_declined", err.Error())
+		return false
+	}
+	if err := processor.Capture(ctx, *p.PSPReference); err != nil {
+		if errors.Is(err, psp.ErrUnavailable) || errors.Is(err, context.DeadlineExceeded) {
+			// Unreachable is not refused. Retry with the same PSP reference (the
+			// capture is idempotent); ExpireStuckCaptures bounds the wait. The hold
+			// is still intact, so nothing is stranded meanwhile.
+			e.log.Warn("PSP capture unavailable — will retry", "payment_id", p.ID, "error", err)
+			e.touch(ctx, p.ID)
+			return false
+		}
+		e.failAndCompensate(ctx, p, "gateway_capture_failed", err.Error())
+		return false
+	}
+	// Durably record that the processor HAS the money, before we try to write the
+	// ledger. A resumed worker must never have to guess this: past this point the
+	// hold must never be released, or we would refund money the network took.
+	if err := e.transition(ctx, p, "psp_captured", "processing", nil); err != nil {
+		e.log.Error("psp_captured checkpoint failed", "payment_id", p.ID, "error", err)
+		return false
+	}
+	return true
+}
+
+// stepLedgerCapture posts the capture the processor already confirmed. It is the
+// local, transactional half, keyed by a deterministic request id, so it is safe
+// to retry until it lands — and it is never compensated away, because the money
+// really is gone from the card network's side.
+func (e *Engine) stepLedgerCapture(ctx context.Context, p *Payment) bool {
 	ledgerTxn, err := e.accounts.Capture(ctx, p.ID.String(), p.HoldID.String(), p.Amount, p.Currency)
 	if err != nil {
-		e.log.Error("ledger capture failed", "payment_id", p.ID, "error", err)
-		return false // retried by resume sweeper; capture request id is deterministic
-	}
-	if processor, perr := e.psps.For(p.Method); perr == nil && p.PSPReference != nil {
-		if cerr := processor.Capture(ctx, *p.PSPReference); cerr != nil {
-			// Ledger already captured — log loudly; reconciliation vs PSP
-			// reports is the settlement-time safety net.
-			e.log.Error("PSP capture confirm failed (ledger already captured)", "payment_id", p.ID, "error", cerr)
-		}
+		// Retried by the resume sweeper with the same request id. This is the one
+		// residual of capturing externally first: the processor has the money and
+		// our books do not say so yet. It is visible, non-terminal and converges;
+		// AlertStalledLedgerCaptures makes it loud if it does not.
+		e.log.Error("ledger capture failed after PSP captured — retrying", "payment_id", p.ID, "error", err)
+		e.touch(ctx, p.ID)
+		return false
 	}
 	fxRate := e.fxRateUsed(ctx, p)
 	err = e.terminalTx(ctx, p, "captured", "succeeded", func(tx pgx.Tx) error {

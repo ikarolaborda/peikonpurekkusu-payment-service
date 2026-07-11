@@ -101,6 +101,8 @@ func run(log *slog.Logger) error {
 	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStaleWallets(ctx, cfg.WalletTimeout) })
 	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStaleRequiresAction(ctx, cfg.RequiresActionTimeout) })
 	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStuckSubmissions(ctx, cfg.GatewaySubmitTimeout) })
+	go every(ctx, cfg.ResumeInterval, func() { engine.ExpireStuckCaptures(ctx, cfg.GatewayCaptureTimeout) })
+	go every(ctx, time.Minute, func() { engine.AlertStalledLedgerCaptures(ctx, 2*time.Minute) })
 	go every(ctx, time.Hour, func() {
 		if n, err := idem.Purge(ctx); err == nil && n > 0 {
 			log.Info("idempotency keys purged", "count", n)
