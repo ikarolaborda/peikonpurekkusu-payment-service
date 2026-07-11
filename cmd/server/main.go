@@ -24,6 +24,7 @@ import (
 	"github.com/peikonpurekkusu/payment-service/internal/consumer"
 	"github.com/peikonpurekkusu/payment-service/internal/events"
 	"github.com/peikonpurekkusu/payment-service/internal/fraudclient"
+	"github.com/peikonpurekkusu/payment-service/internal/gatewayauth"
 	"github.com/peikonpurekkusu/payment-service/internal/httpapi"
 	"github.com/peikonpurekkusu/payment-service/internal/idempotency"
 	"github.com/peikonpurekkusu/payment-service/internal/outbox"
@@ -118,9 +119,13 @@ func run(log *slog.Logger) error {
 		defer cancel()
 		return producer.Ping(pingCtx) == nil
 	}
+	verifier, err := gatewayauth.New(ctx, cfg.JWKSURL, log)
+	if err != nil {
+		return fmt.Errorf("gateway auth verifier: %w", err)
+	}
 	httpSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler:           httpapi.New(pool, idem, engine, bus, cfg.FxQuoteTTL, cfg.StepUpAmountLimit, cfg.StepUpMaxAge, kafkaOK, log).WithReconciler(reconciler).Handler(),
+		Handler:           verifier.Middleware(httpapi.New(pool, idem, engine, bus, cfg.FxQuoteTTL, cfg.StepUpAmountLimit, cfg.StepUpMaxAge, kafkaOK, log).WithReconciler(reconciler).Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      0, // SSE endpoints stream indefinitely

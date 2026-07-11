@@ -17,6 +17,7 @@ type Config struct {
 
 	KafkaBootstrap    string
 	SchemaRegistryURL string
+	JWKSURL           string
 
 	AccountGRPCAddr string
 	FraudGRPCAddr   string
@@ -61,6 +62,7 @@ func Load() (Config, error) {
 		DBName:             os.Getenv("PAYMENT_DB_NAME"),
 		KafkaBootstrap:     getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092"),
 		SchemaRegistryURL:  getenv("SCHEMA_REGISTRY_URL", "http://apicurio-registry:8080/apis/ccompat/v7"),
+		JWKSURL:            getenv("GATEWAY_JWKS_URL", "http://user-service:8080/.well-known/jwks.json"),
 		AccountGRPCAddr:    getenv("ACCOUNT_GRPC_ADDR", "account-service:9090"),
 		FraudGRPCAddr:      getenv("FRAUD_GRPC_ADDR", "fraud-service:9090"),
 		MockPSPBaseURL:     getenv("MOCK_PSP_BASE_URL", "http://mock-psp:8080"),
